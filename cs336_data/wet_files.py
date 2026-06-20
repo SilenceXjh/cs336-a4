@@ -1,23 +1,47 @@
 import gzip
+import os
+import random
 import shutil
 import tempfile
+import time
 import urllib.request
 from functools import cached_property
 from io import BytesIO
 from pathlib import Path
 
 from collections.abc import Callable
-import fasttext
 import modal
-import polars as pl
 from warcio.archiveiterator import ArchiveIterator
 from warcio.warcwriter import WARCWriter
 
 from cs336_data.common import get_shared_assets_path
+from cs336_data.langid import identify_language
 from cs336_data.modal_utils import VOLUME_MOUNTS, app, build_image
 from furu import Furu
 
 BASE_URL = "https://data.commoncrawl.org/"
+ENGLISH_PROBABILITY_THRESHOLD = 0.7
+
+
+def _urlretrieve_with_retries(url: str, filename: Path, *, attempts: int = 10) -> None:
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            urllib.request.urlretrieve(url, filename)
+            return
+        except Exception as error:
+            last_error = error
+            if attempt == attempts:
+                break
+            time.sleep(min(2**attempt, 30))
+    assert last_error is not None
+    raise last_error
+
+
+def _is_english(text: str) -> bool:
+    language, score = identify_language(text)
+    return language == "en" and score >= ENGLISH_PROBABILITY_THRESHOLD
 
 
 
@@ -28,8 +52,7 @@ class _EnglishWetFile(Furu[Path]):
         output_path = self.data_dir / "data.warc.wet.gz"
 
         self.logger.info("Loading English language identifier")
-        is_english: Callable[[str], bool] = "TODO"
-        assert is_english != "TODO", "you need to implement is_english. we use probability >= 0.7 with https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin"
+        is_english: Callable[[str], bool] = _is_english
 
         total_text = 0
         skipped_text = 0
@@ -48,7 +71,7 @@ class _EnglishWetFile(Furu[Path]):
                 local_wet_path = Path("/tmp") / wet_url.split("/")[-1]
                 if not local_wet_path.exists():
                     self.logger.info("Downloading %s to %s", wet_url, local_wet_path)
-                    urllib.request.urlretrieve(wet_url, local_wet_path)
+                    _urlretrieve_with_retries(wet_url, local_wet_path)
                 else:
                     self.logger.info("Using cached WET file %s", local_wet_path)
                 with gzip.open(local_wet_path, "rb") as input_stream:
@@ -85,25 +108,37 @@ def make_wet_file_on_modal(wet_file: _EnglishWetFile) -> Path:
     return wet_file.load_or_create()
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be an integer, got {value!r}") from error
+
+
 class EnglishWetFiles(Furu[list[Path]]):
-    n_files: int = 2500
-    group_size: int = 4
+    n_files: int = _env_int("CS336_ENGLISH_WET_N_FILES", 2500)
+    group_size: int = _env_int("CS336_ENGLISH_WET_GROUP_SIZE", 4)
     shuffle_seed: int = 336
     crawl_id: str = "CC-MAIN-2026-17"
 
     def _create(self) -> list[Path]:
-        assert self.n_files % self.group_size == 0
-        wet_paths = f"{BASE_URL}crawl-data/{self.crawl_id}/wet.paths.gz"
-        self.logger.info("Loading WET paths from %s", wet_paths)
-
-        wet_urls = list(
-            BASE_URL
-            + pl.read_csv(
-                wet_paths,
-                has_header=False,
-                new_columns=["wet_path"],
-            ).sample(n=self.n_files, shuffle=True, seed=self.shuffle_seed, with_replacement=False)["wet_path"]
-        )
+        explicit_wet_urls = os.environ.get("CS336_ENGLISH_WET_URLS")
+        if explicit_wet_urls:
+            wet_urls = [url.strip() for url in explicit_wet_urls.split(",") if url.strip()]
+            self.logger.info("Using %d explicit WET URLs", len(wet_urls))
+        else:
+            assert self.n_files % self.group_size == 0
+            wet_paths = f"{BASE_URL}crawl-data/{self.crawl_id}/wet.paths.gz"
+            self.logger.info("Loading WET paths from %s", wet_paths)
+            local_wet_paths = get_shared_assets_path() / "common-crawl" / self.crawl_id / "wet.paths.gz"
+            _urlretrieve_with_retries(wet_paths, local_wet_paths)
+            with gzip.open(local_wet_paths, "rt") as f:
+                all_wet_paths = [line.strip() for line in f if line.strip()]
+            selected_wet_paths = random.Random(self.shuffle_seed).sample(all_wet_paths, k=self.n_files)
+            wet_urls = [BASE_URL + path for path in selected_wet_paths]
 
         self.logger.info("Selected %d WET files for crawl %s", len(wet_urls), self.crawl_id)
 
@@ -124,6 +159,16 @@ class EnglishWetFiles(Furu[list[Path]]):
                     wet_file_idx,
                     len(wet_files),
                 )
+
+            repo_path = get_shared_assets_path() / "english-wet-data"
+            repo_path.mkdir(exist_ok=True)
+            self.logger.info("Linking local WET outputs into %s", repo_path)
+            for wet_data_idx, wet_data_path in enumerate(wet_data_paths):
+                link_path = repo_path / f"{wet_data_idx:05d}-{wet_data_path.name}"
+                if link_path.exists() or link_path.is_symlink():
+                    link_path.unlink()
+                link_path.symlink_to(wet_data_path)
+                self.logger.info("Linked WET chunk %d: %s -> %s", wet_data_idx, link_path, wet_data_path)
         else:
             self.logger.info("downloading wet files on remote")
 
